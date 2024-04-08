@@ -1,0 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cu118
+torch==2.1.0+cu118
+wandb
+pandas
+matplotlib
+torchmetrics
+tqdm
+joblib
+einops
+sklearn==0.0
