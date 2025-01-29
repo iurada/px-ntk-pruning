@@ -499,35 +499,65 @@ class PX(Pruner):
 class PXact(Pruner):
     def __init__(self, masked_params, model=None):
         super(PXact, self).__init__(masked_params)
-        self.epsilon = 1e-6
 
     def score(self, model, loss, dataloader, device):
-        
+
         for m, p in self.masked_parameters:
             self.scores[id(p)] = torch.zeros_like(p)
 
+        def hook_activation(module, input, output):
+            self.activation_maps.append(input[0].clone().detach())
+
+        def apply_activation(module, input, output):
+            map = torch.where(self.activation_maps.pop(0) > 0, 1.0, 0.0)
+            return output * map
+        
+        aux_model = eval(CONFIG.experiment_args['aux_model'])(num_classes=CONFIG.num_classes)
+        with torch.no_grad():
+            for (_, p1), (_, p2) in zip(model.state_dict().items(), aux_model.state_dict().items()):
+                p2.copy_(p1)
+            for (sm, sp), (tm, tp) in zip(masked_parameters(model), masked_parameters(aux_model)):
+                tp.copy_(sp)
+                tm.copy_(sm)
+                tp.mul_(tm)
+        aux_model.eval()
+        aux_model = aux_model.to(device)
+
+        # Path-value Estimator
+        vp_model = copy.deepcopy(aux_model)
+        vp_model.set_activations(False)
+        for layer in vp_model.modules():
+            if isinstance(layer, (layers.ReLU, layers.LeakyReLU)):
+                layer.register_forward_hook(apply_activation)
+
+        # Auxiliary Activation Maps Extractor
+        activation_model = copy.deepcopy(aux_model)
+        activation_model.set_activations(True)
+        for layer in activation_model.modules():
+            if isinstance(layer, (layers.ReLU, layers.LeakyReLU)):
+                layer.register_forward_hook(hook_activation)
+
+        # PXact
         for batch_idx, data_tuple in enumerate(tqdm(dataloader)):
             if batch_idx == CONFIG.experiment_args['batch_limit']: break       
             if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                 data, y = data_tuple
-            data = data.to(device)
+            data, y = data.to(device), y.to(device)
 
-            model_copy = copy.deepcopy(model)
-            with torch.no_grad():
-                for _, p in masked_parameters(model_copy):
-                    p.data = p.data + self.epsilon * torch.randn_like(p.data)
+            for xi, yi in [(data[:len(data)//2], y[:len(data)//2]), (data[len(data)//2:], y[len(data)//2:])]:
+                
+                with torch.no_grad():
+                    self.activation_maps = []
+                    activation_model(xi)
+                samples = vp_model(xi).gather(1, yi.unsqueeze(1))
 
-            for xi in [data[:len(data)//2], data[len(data)//2:]]:
-                samples = model_copy(xi).sum(1)
                 for idx in range(samples.size(0)):
-                    model_copy.zero_grad()
+                    vp_model.zero_grad()
                     torch.autograd.backward(samples[idx], retain_graph=True)
-                    for (m, p), (_, p1) in zip(self.masked_parameters, masked_parameters(model_copy)):
-                        if p1.grad is None: continue
-                        self.scores[id(p)] += p1.grad.clone().detach().pow(2)
-        
-        for m, p in self.masked_parameters:
-            self.scores[id(p)] *= p.clone().detach().pow(2)
+                    for (m, p), (_, op) in zip(masked_parameters(vp_model), self.masked_parameters):
+                        if p.grad is None: continue
+                        self.scores[id(op)] += p.grad.data.clone().detach().pow(2)
 
-
-            
+        with torch.no_grad():
+            for m, p in self.masked_parameters:
+                self.scores[id(p)] *= p.clone().detach().pow(2)            
