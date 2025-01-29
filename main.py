@@ -10,6 +10,7 @@ from parse_args import parse_arguments
 
 from train_classification import Experiment
 from train_segmentation import Experiment as SegmentationExperiment
+from transfer_classification import Experiment as TransferClassificationExperiment
 
 from globals import CONFIG
 
@@ -24,6 +25,8 @@ def main():
 
     if CONFIG.task == 'segmentation':
         experiment = SegmentationExperiment()
+    elif CONFIG.task == 'transfer_classification':
+        experiment = TransferClassificationExperiment()
     else:
         experiment = Experiment()
 

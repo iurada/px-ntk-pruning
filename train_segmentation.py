@@ -9,7 +9,7 @@ import wandb
 import copy
 import math
 
-from lib.pruners import Rand, SNIP, GraSP, SynFlow, SynFlowL2, NTKSAP, Mag, PX
+from lib.pruners import Rand, SNIP, GraSP, SynFlow, SynFlowL2, NTKSAP, Mag, PX, PXact
 from lib.generator import masked_parameters, parameters, prunable
 
 from lib.models.segmentation.deeplabv3 import deeplabv3plus_resnet50
@@ -34,7 +34,7 @@ class Experiment:
     def __init__(self):
         assert CONFIG.dataset in ['VOC2012'], f'"{CONFIG.dataset}" dataset not available!'
         assert CONFIG.pruner in ['Dense', 'Rand', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2',
-                                 'NTKSAP', 'Mag', 'PX', 'IMP'], f'"{CONFIG.pruner}" pruning strategy not available!'
+                                 'NTKSAP', 'Mag', 'PX', 'IMP', 'PXact'], f'"{CONFIG.pruner}" pruning strategy not available!'
         assert CONFIG.arch in ['deeplabv3plus_resnet50'], f'"{CONFIG.arch}" architecture not available!'
 
 
@@ -54,13 +54,13 @@ class Experiment:
 
 
         # Pruning strategy
-        if CONFIG.pruner in ['Rand', 'Mag', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2', 'NTKSAP', 'PX']: #! Pruning-at-init         
+        if CONFIG.pruner in ['Rand', 'Mag', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2', 'NTKSAP', 'PX', 'PXact']: #! Pruning-at-init         
             ROUNDS = CONFIG.experiment_args['rounds']
             sparsity = CONFIG.experiment_args['weight_remaining_ratio']
 
             self.pruner = eval(CONFIG.pruner)(masked_parameters(self.model))
 
-            if CONFIG.pruner in ['SynFlow', 'SynFlowL2', 'PX']:
+            if CONFIG.pruner in ['SynFlow', 'SynFlowL2', 'PX', 'PXact']:
                 self.model.eval()
             
             for round in range(ROUNDS):

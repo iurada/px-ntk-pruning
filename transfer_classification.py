@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.jit
 import os
 import logging
@@ -12,18 +13,13 @@ import copy
 from lib.pruners import Rand, SNIP, GraSP, SynFlow, SynFlowL2, NTKSAP, Mag, PX, PXact
 from lib.generator import masked_parameters, parameters, prunable
 
-from lib.models.lottery_resnet import resnet20
-from lib.models.lottery_vgg import vgg16_bn
-from lib.models.tinyimagenet_resnet import resnet18 as tinyimagenet_resnet18
 from lib.models.imagenet_resnet import resnet50
+from lib.models.heads import get_ridge_classification_head
 
 import lib.metrics as metrics
 import lib.layers as layers
 
-import datasets.CIFAR10.dataset as CIFAR10
-import datasets.CIFAR100.dataset as CIFAR100
-import datasets.TinyImageNet.dataset as TinyImageNet
-import datasets.ImageNet.dataset as ImageNet
+import datasets.ImageNetK.dataset as ImageNet10
 
 from globals import CONFIG
 
@@ -38,28 +34,32 @@ def kaiming_normal_init(model):
 class Experiment:
 
     def __init__(self):
-        assert CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet'], f'"{CONFIG.dataset}" dataset not available!'
+        assert CONFIG.dataset in ['ImageNet10'], f'"{CONFIG.dataset}" dataset not available!'
         assert CONFIG.pruner in ['Dense', 'Rand', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2',
                                  'NTKSAP', 'Mag', 'PX', 'IMP', 'PXact'], f'"{CONFIG.pruner}" pruning strategy not available!'
-        assert CONFIG.arch in ['resnet20', 'vgg16_bn', 'tinyimagenet_resnet18', 
-                               'resnet50'], f'"{CONFIG.arch}" architecture not available!'
+        assert CONFIG.arch in ['resnet50'], f'"{CONFIG.arch}" architecture not available!'
 
 
         # Load data
-        self.data = eval(CONFIG.dataset).load_data()
-
+        self.data = eval(CONFIG.dataset).load_data(CONFIG.dataset_args['split_nr'])
 
         # Initialize model
         self.model = eval(CONFIG.arch)(num_classes=CONFIG.num_classes)
         self.model = self.model.to(CONFIG.device)
 
-
+        # Fit ridge classifier
+        self.model.fc = nn.Identity()
+        self.model.fc = get_ridge_classification_head(self.model, 
+                                                      self.data['test'], 
+                                                      CONFIG.num_classes,
+                                                      CONFIG.device)
+        self.model.fc.requires_grad_(False)
+        
         # Optimizers, schedulers & losses
         self._init_optimizers()
-        
+
         # Meters
         self._init_meters()
-
 
         # Pruning strategy
         if CONFIG.pruner in ['Rand', 'Mag', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2', 'NTKSAP', 'PX', 'PXact']: # Pruning-at-init         
@@ -125,42 +125,25 @@ class Experiment:
                 with pd.option_context('display.max_rows', None, 'display.max_columns', None):  # more options can be specified also
                     logging.info(prune_result)
 
+        self.can_eval_transfer = True
+        # Zero-shot Eval
+        logging.info('Zero-shot Post-pruning Transfer')
+        self.evaluate_transfer()
+
 
     def _init_optimizers(self):
         self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 
-        if CONFIG.dataset == 'CIFAR10':
-            milestones = [80, 120]
-            if 'pretrain' in CONFIG.experiment_args:
-                milestones = [91, 136]
-            self.optimizer = torch.optim.SGD(parameters(self.model), lr=0.1, momentum=0.9, weight_decay=1e-4)
-            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=milestones, gamma=0.1)
-            self.loss_fn = nn.CrossEntropyLoss()
-
-        elif CONFIG.dataset == 'CIFAR100':
-            wd, nesterov, milestones = 5e-4, True, [60, 120]
-            if 'pretrain' in CONFIG.experiment_args:
-                wd, nesterov, milestones = 1e-4, False, [91, 136]
-            self.optimizer = torch.optim.SGD(parameters(self.model), lr=0.1, momentum=0.9, weight_decay=wd, nesterov=nesterov)
-            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=milestones, gamma=0.1)
-            self.loss_fn = nn.CrossEntropyLoss()
-
-        elif CONFIG.dataset == 'TinyImageNet':
-            lr, milestones = 0.2, [100, 150]
-            if 'pretrain' in CONFIG.experiment_args:
-                lr, milestones = 0.1, [91, 136]
-            self.optimizer = torch.optim.SGD(parameters(self.model), lr=lr, momentum=0.9, weight_decay=1e-4)
-            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=milestones, gamma=0.1)
-            self.loss_fn = nn.CrossEntropyLoss()
-
-        elif CONFIG.dataset == 'ImageNet':
-            self.optimizer = torch.optim.SGD(parameters(self.model), lr=0.1, momentum=0.9, weight_decay=1e-4)
+        if CONFIG.dataset == 'ImageNet10':
+            # imagenet-pt: lr=5e-5
+            self.optimizer = torch.optim.SGD([p for p in self.model.parameters() if p.requires_grad], lr=5e-5, momentum=0.9, weight_decay=1e-4)
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=[30, 60, 80], gamma=0.1)
-            self.loss_fn = nn.CrossEntropyLoss()
+            self.loss_fn = lambda input, target: F.mse_loss(input, F.one_hot(target, num_classes=CONFIG.num_classes).float())
+            self.loss_fn_eval = lambda input, target: F.mse_loss(input, F.one_hot(target, num_classes=CONFIG.num_classes).float(), reduction='sum')
 
 
     def _init_meters(self):
-        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+        if CONFIG.dataset in ['ImageNet10']:
             self.acc_tot = Accuracy(task='multiclass', num_classes=CONFIG.num_classes)
             self.acc_tot = self.acc_tot.to(CONFIG.device)
 
@@ -180,11 +163,13 @@ class Experiment:
         # Train loop
         for epoch in range(current_epoch, CONFIG.epochs):
             self.model.train()
+            if CONFIG.experiment_args['freeze_bn_fit']:
+                self.model.eval()
 
             # Train epoch
             for batch_idx, data_tuple in tqdm(enumerate(self.data['train'])):
 
-                if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+                if CONFIG.dataset in ['ImageNet10']:
                     x, y = data_tuple
                     x = x.to(CONFIG.device)
                     y = y.to(CONFIG.device)
@@ -208,7 +193,7 @@ class Experiment:
             # Validation
             logging.info(f'[VAL @ Epoch={epoch}]')
 
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+            if CONFIG.dataset in ['ImageNet10']:
                 metrics = self.evaluate(self.data['test'])
 
                 # Model selection & State management
@@ -222,6 +207,10 @@ class Experiment:
                 else:
                     best_model = copy.deepcopy(self.model)
 
+        if self.can_eval_transfer:
+            logging.info('Post-retraining Transfer')
+            self.evaluate_transfer()
+
         return best_model
 
 
@@ -230,28 +219,28 @@ class Experiment:
         self.model.eval()
 
         # Reset meters
-        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+        if CONFIG.dataset in ['ImageNet10']:
             self.acc_tot.reset()
 
         # Validation loop
         loss = [0.0, 0]
         for data_tuple in tqdm(loader):
 
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+            if CONFIG.dataset in ['ImageNet10']:
                 x, y = data_tuple
                 x = x.to(CONFIG.device)
                 y = y.to(CONFIG.device)
 
             with torch.autocast(device_type=CONFIG.device, dtype=torch.float16, enabled=True):
                 logits = self.model(x).squeeze()
-                loss[0] += self.loss_fn(logits, y).item()
+                loss[0] += self.loss_fn_eval(logits, y).item()
                 loss[1] += x.size(0)
                 
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+            if CONFIG.dataset in ['ImageNet10']:
                 self.acc_tot.update(logits, y)
 
         # Compute metrics
-        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet']:
+        if CONFIG.dataset in ['ImageNet10']:
             acc_tot = self.acc_tot.compute()
 
             metrics = {
@@ -260,4 +249,72 @@ class Experiment:
             }
 
         logging.info(metrics)
+        return metrics
+    
+
+    @torch.no_grad()
+    def evaluate_transfer(self):
+        self.model.eval()
+        
+        num_splits = {
+            'ImageNet10': 10
+        }
+
+        for split_nr in range(num_splits[CONFIG.dataset]):
+
+            # Load data
+            data = eval(CONFIG.dataset).load_data(split_nr)
+
+            # Initialize model
+            clean_model = eval(CONFIG.arch)(num_classes=CONFIG.num_classes)
+            clean_model.fc = nn.Identity()
+            clean_model = clean_model.to(CONFIG.device)
+            
+            # Fit ridge classifier
+            copy_model = copy.deepcopy(self.model)
+            copy_model.fc = get_ridge_classification_head(clean_model, 
+                                                          data['test'], 
+                                                          CONFIG.num_classes,
+                                                          CONFIG.device)
+            clean_model = clean_model.to('cpu')
+            del clean_model
+            torch.cuda.empty_cache()
+
+            # Reset meters
+            if CONFIG.dataset in ['ImageNet10']:
+                self.acc_tot.reset()
+
+            # Validation loop
+            loss = [0.0, 0]
+            for data_tuple in tqdm(data['test']):
+
+                if CONFIG.dataset in ['ImageNet10']:
+                    x, y = data_tuple
+                    x = x.to(CONFIG.device)
+                    y = y.to(CONFIG.device)
+
+                with torch.autocast(device_type=CONFIG.device, dtype=torch.float16, enabled=True):
+                    logits = copy_model(x).squeeze()
+                    loss[0] += self.loss_fn_eval(logits, y).item()
+                    loss[1] += x.size(0)
+                    
+                if CONFIG.dataset in ['ImageNet10']:
+                    self.acc_tot.update(logits, y)
+
+            # Compute metrics
+            if CONFIG.dataset in ['ImageNet10']:
+                acc_tot = self.acc_tot.compute()
+
+                metrics = {
+                    'Split': split_nr,
+                    'Acc': acc_tot.item(),
+                    'Loss': loss[0] / loss[1]
+                }
+
+            logging.info(metrics)
+
+            copy_model = copy_model.to('cpu')
+            del copy_model
+            torch.cuda.empty_cache()
+
         return metrics

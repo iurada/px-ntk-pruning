@@ -127,7 +127,7 @@ class SNIP(Pruner):
         for batch_idx, data_tuple in enumerate(dataloader):
             if batch_idx == CONFIG.experiment_args['batch_limit']: break
             
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                 data, y = data_tuple
                 data, y = data.to(device), y.to(device)
         
@@ -170,7 +170,7 @@ class GraSP(Pruner):
         for batch_idx, data_tuple in enumerate(dataloader):
             if batch_idx == CONFIG.experiment_args['batch_limit']: break
         
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                 data, y = data_tuple
                 data, y = data.to(device), y.to(device)
         
@@ -185,7 +185,7 @@ class GraSP(Pruner):
         for batch_idx, data_tuple in enumerate(dataloader):
             if batch_idx == CONFIG.experiment_args['batch_limit']: break
         
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                 data, y = data_tuple
                 
                 data, y = data.to(device), y.to(device)
@@ -238,7 +238,7 @@ class SynFlow(Pruner):
         signs = linearize(model)
 
         data_tuple = next(iter(dataloader))
-        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
             data, y = data_tuple
 
         input_dim = list(data[0,:].shape)
@@ -277,7 +277,7 @@ class SynFlowL2(Pruner):
         linearize(lin_model)
 
         data_tuple = next(iter(dataloader))
-        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
             data, y = data_tuple
 
         input_dim = list(data[0,:].shape)
@@ -350,7 +350,7 @@ class NTKSAP(Pruner):
             for index, data_tuple in tqdm(enumerate(dataloader)):
                 if index == CONFIG.experiment_args['batch_limit']: break
 
-                if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+                if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                     data, y = data_tuple
 
                 if isinstance(model, nn.DataParallel):
@@ -419,17 +419,14 @@ class PX(Pruner):
                 tp.copy_(sp)
                 tm.copy_(sm)
                 tp.mul_(tm)
-        aux_model.train()
+        aux_model.eval()
         aux_model = aux_model.to(device)
 
         # Path Kernel Estimator
         pk_model = copy.deepcopy(aux_model)
         pk_model.set_activations(False)
         with torch.no_grad():
-            skip_layers = ['weight_mask', 'bias_mask', 'bn']
             for name, param in pk_model.state_dict().items():
-                if any([n in name for n in skip_layers]):
-                    continue
                 param.pow_(2)
 
         # Path Activation Matrix Estimator
@@ -439,9 +436,17 @@ class PX(Pruner):
             if isinstance(layer, (layers.ReLU, layers.LeakyReLU)):
                 layer.register_forward_hook(apply_activation)
         with torch.no_grad():
-            for m, p in masked_parameters(jvf_model):
-                p[m > 0].fill_(1.0)
-                p[m <= 0].fill_(0.0)
+            for layer in jvf_model.modules():
+                if isinstance(layer, (layers.Conv2d, layers.Linear)):
+                    layer.weight.fill_(1.0)
+                    if hasattr(layer, 'bias') and layer.bias is not None: 
+                        layer.bias.fill_(0.0)
+                elif isinstance(layer, nn.BatchNorm2d):
+                    layer.track_running_stats = False
+                    layer.running_mean.fill_(0.0)
+                    layer.running_var.fill_(1.0)
+                    layer.weight.fill_(1.0)
+                    layer.bias.fill_(0.0)
 
         # Auxiliary Activation Maps Extractor
         activation_model = copy.deepcopy(aux_model)
@@ -449,25 +454,80 @@ class PX(Pruner):
         for layer in activation_model.modules():
             if isinstance(layer, (layers.ReLU, layers.LeakyReLU)):
                 layer.register_forward_hook(hook_activation)
-        
+
         # PX
         for batch_idx, data_tuple in enumerate(dataloader):
             if batch_idx == CONFIG.experiment_args['batch_limit']: break       
-            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012']:
+            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                 data, y = data_tuple
             data = data.to(device)
 
             with torch.no_grad():
                 self.activation_maps = []
                 activation_model(data)
-                z1 = jvf_model(data)
-            z2 = pk_model(data)
-            (z1 * z2).sum().backward()
+                z1 = jvf_model(data.pow(2))
+            z2 = pk_model(torch.ones_like(data))
+            R = torch.sum(z1 * z2)
+            grads = torch.autograd.grad(R, pk_model.parameters(), allow_unused=True)
 
+            with torch.no_grad():
+                for grad, param in zip(grads, pk_model.parameters()):
+                    if grad is None:
+                        grad = torch.zeros_like(param)
+                    setattr(param, 'grad', grad)
+
+                for (m, p), (_, p1), (_, p2) in zip(self.masked_parameters, masked_parameters(pk_model), masked_parameters(jvf_model)):
+                    if p1.grad is None:
+                        self.scores[id(p)] = torch.zeros_like(p)
+                        continue
+                    if id(p) not in self.scores:
+                        self.scores[id(p)] = p1.grad.pow(2)
+                        self.scores[id(p)].detach_()
+                    else:
+                        self.scores[id(p)] += p1.grad.pow(2)
+                        self.scores[id(p)].detach_()
+            
         with torch.no_grad():
             for (m, p), (_, p1), (_, p2) in zip(self.masked_parameters, masked_parameters(pk_model), masked_parameters(jvf_model)):
                 if p1.grad is None:
                     self.scores[id(p)] = torch.zeros_like(p)
                     continue
-                score = p1.grad * p1 * p2
+                score = self.scores[id(p)]
                 self.scores[id(p)] = torch.clone(score * p.pow(2)).abs()
+
+
+class PXact(Pruner):
+    def __init__(self, masked_params, model=None):
+        super(PXact, self).__init__(masked_params)
+        self.epsilon = 1e-6
+
+    def score(self, model, loss, dataloader, device):
+        
+        for m, p in self.masked_parameters:
+            self.scores[id(p)] = torch.zeros_like(p)
+
+        for batch_idx, data_tuple in enumerate(tqdm(dataloader)):
+            if batch_idx == CONFIG.experiment_args['batch_limit']: break       
+            if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
+                data, y = data_tuple
+            data = data.to(device)
+
+            model_copy = copy.deepcopy(model)
+            with torch.no_grad():
+                for _, p in masked_parameters(model_copy):
+                    p.data = p.data + self.epsilon * torch.randn_like(p.data)
+
+            for xi in [data[:len(data)//2], data[len(data)//2:]]:
+                samples = model_copy(xi).sum(1)
+                for idx in range(samples.size(0)):
+                    model_copy.zero_grad()
+                    torch.autograd.backward(samples[idx], retain_graph=True)
+                    for (m, p), (_, p1) in zip(self.masked_parameters, masked_parameters(model_copy)):
+                        if p1.grad is None: continue
+                        self.scores[id(p)] += p1.grad.clone().detach().pow(2)
+        
+        for m, p in self.masked_parameters:
+            self.scores[id(p)] *= p.clone().detach().pow(2)
+
+
+            
