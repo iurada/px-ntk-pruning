@@ -10,7 +10,7 @@ import pandas as pd
 import wandb
 import copy
 
-from lib.pruners import Rand, SNIP, GraSP, SynFlow, SynFlowL2, NTKSAP, Mag, PX, PXact
+from lib.pruners import Rand, SNIP, GraSP, SynFlow, SynFlowL2, NTKSAP, Mag, PX
 from lib.generator import masked_parameters, parameters, prunable
 
 from lib.models.imagenet_resnet import resnet50
@@ -36,8 +36,9 @@ class Experiment:
     def __init__(self):
         assert CONFIG.dataset in ['ImageNet10'], f'"{CONFIG.dataset}" dataset not available!'
         assert CONFIG.pruner in ['Dense', 'Rand', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2',
-                                 'NTKSAP', 'Mag', 'PX', 'IMP', 'PXact'], f'"{CONFIG.pruner}" pruning strategy not available!'
+                                 'NTKSAP', 'Mag', 'PX', 'IMP'], f'"{CONFIG.pruner}" pruning strategy not available!'
         assert CONFIG.arch in ['resnet50'], f'"{CONFIG.arch}" architecture not available!'
+        assert CONFIG.experiment_args['pretrain'] in ['imagenet', 'mocov2', 'dino'], f'"{CONFIG.experiment_args["pretrain"]}" pretrain not available!'
 
 
         # Load data
@@ -62,13 +63,13 @@ class Experiment:
         self._init_meters()
 
         # Pruning strategy
-        if CONFIG.pruner in ['Rand', 'Mag', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2', 'NTKSAP', 'PX', 'PXact']: # Pruning-at-init         
+        if CONFIG.pruner in ['Rand', 'Mag', 'SNIP', 'GraSP', 'SynFlow', 'SynFlowL2', 'NTKSAP', 'PX']: # Pruning-at-init         
             ROUNDS = CONFIG.experiment_args['rounds']
             sparsity = CONFIG.experiment_args['weight_remaining_ratio']
 
             self.pruner = eval(CONFIG.pruner)(masked_parameters(self.model))
 
-            if CONFIG.pruner in ['SynFlow', 'SynFlowL2', 'PX', 'PXact']:
+            if CONFIG.pruner in ['SynFlow', 'SynFlowL2', 'PX']:
                 self.model.eval()
             
             for round in range(ROUNDS):
@@ -135,7 +136,6 @@ class Experiment:
         self.scaler = torch.cuda.amp.GradScaler(enabled=True)
 
         if CONFIG.dataset == 'ImageNet10':
-            # imagenet-pt: lr=5e-5
             self.optimizer = torch.optim.SGD([p for p in self.model.parameters() if p.requires_grad], lr=5e-5, momentum=0.9, weight_decay=1e-4)
             self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optimizer, milestones=[30, 60, 80], gamma=0.1)
             self.loss_fn = lambda input, target: F.mse_loss(input, F.one_hot(target, num_classes=CONFIG.num_classes).float())
@@ -269,7 +269,7 @@ class Experiment:
             clean_model = eval(CONFIG.arch)(num_classes=CONFIG.num_classes)
             clean_model.fc = nn.Identity()
             clean_model = clean_model.to(CONFIG.device)
-            
+
             # Fit ridge classifier
             copy_model = copy.deepcopy(self.model)
             copy_model.fc = get_ridge_classification_head(clean_model, 

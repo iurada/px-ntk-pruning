@@ -347,7 +347,7 @@ def load_data(split_nr=0):
     CONFIG.data_input_size = (3, 224, 224)
 
     mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
-    train_transform = get_transform(train=True, mean=mean, std=std)
+    train_transform = get_transform(train=False, mean=mean, std=std)
     test_transform = get_transform(train=False, mean=mean, std=std)
 
     train_loader = ImageNetK(train_transform, location=CONFIG.dataset_args['root'], 
