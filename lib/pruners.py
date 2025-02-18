@@ -7,6 +7,7 @@ from globals import CONFIG
 import lib.generator as generator
 import lib.layers as layers
 from lib.generator import masked_parameters
+from torch.utils.data import DataLoader, Subset
 
 class Pruner:
     def __init__(self, masked_parameters):
@@ -394,12 +395,35 @@ class NTKSAP(Pruner):
 
 
 class PX(Pruner):
-    def __init__(self, masked_params, model=None):
-        super(PX, self).__init__(masked_params)
+    def __init__(self, masked_parameters):
+        super(PX, self).__init__(masked_parameters)
         self.orig_relu = F.relu
         self.orig_leakyrelu = F.leaky_relu
 
+    def get_balanced_subset(self, dataset, num_samples_per_class):
+        class_labels = dataset.targets if hasattr(dataset, 'targets') else dataset.labels
+        class_to_indices = {}
+        for idx, label in enumerate(class_labels):
+            if label not in class_to_indices:
+                class_to_indices[label] = []
+            class_to_indices[label].append(idx)
+        sampled_indices = []
+        for label in class_to_indices:
+            indices = class_to_indices[label]
+            if len(indices) >= num_samples_per_class:
+                sampled_indices.extend(indices[:num_samples_per_class])
+            else:
+                raise ValueError(f"Class {label} has fewer than {num_samples_per_class} samples.")
+        return Subset(dataset, sampled_indices)
+
     def score(self, model, loss, dataloader, device):
+
+        if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet']:
+            balanced_dset = DataLoader(self.get_balanced_subset(dataloader.dataset, 
+                                    CONFIG.experiment_args['examples_per_class']),
+                                    batch_size=CONFIG.batch_size, shuffle=False)
+        else:
+            balanced_dset = dataloader
 
         def hook_activation(input, inplace=False): # overrides F.relu
             self.activation_maps.append(input.clone().detach())
@@ -412,7 +436,7 @@ class PX(Pruner):
         # Path Kernel Estimator
         pk_model = copy.deepcopy(model).train().to(device)
         with torch.no_grad():
-            skip_layers = ['weight_mask', 'bias_mask', 'bn']
+            skip_layers = ['weight_mask', 'bias_mask', 'bn', 'fc']
             for name, param in pk_model.state_dict().items():
                 if any([n in name for n in skip_layers]):
                     continue
@@ -421,15 +445,16 @@ class PX(Pruner):
         # Path Activation Matrix Estimator
         jvf_model = copy.deepcopy(model).train().to(device)
         with torch.no_grad():
-            for m, p in masked_parameters(jvf_model):
-                p[m > 0].fill_(1.0)
-                p[m <= 0].fill_(0.0)
+            skip_layers = ['weight_mask', 'bias_mask', 'bn', 'fc']
+            for name, param in jvf_model.state_dict().items():
+                if any([n in name for n in skip_layers]):
+                    continue
+                param.fill_(1.0)
 
         # Auxiliary Activation Maps Extractor
         activation_model = copy.deepcopy(model).eval().to(device)
 
-        for batch_idx, data_tuple in enumerate(tqdm(dataloader)):
-            if batch_idx == CONFIG.experiment_args['batch_limit']: break       
+        for data_tuple in tqdm(balanced_dset):     
             if CONFIG.dataset in ['CIFAR10', 'CIFAR100', 'TinyImageNet', 'ImageNet', 'VOC2012', 'ImageNet10']:
                 data, y = data_tuple
             data = data.to(device)
@@ -441,20 +466,19 @@ class PX(Pruner):
                 activation_model(data)
 
                 F.relu = apply_activation
-                z1 = jvf_model(data)
+                z1 = jvf_model(data.pow(2))
             
             F.relu = lambda input, *args, **kwargs: input
             F.leaky_relu = lambda input, *args, **kwargs: input
-            z2 = pk_model(data)
+            z2 = pk_model(torch.ones_like(data))
             (z1 * z2).sum().backward()
+            
+            F.relu = self.orig_relu
+            F.leaky_relu = self.orig_leakyrelu
         
-        F.relu = self.orig_relu
-        F.leaky_relu = self.orig_leakyrelu
-
         with torch.no_grad():
             for (m, p), (_, p1), (_, p2) in zip(self.masked_parameters, masked_parameters(pk_model), masked_parameters(jvf_model)):
                 if p1.grad is None:
                     self.scores[id(p)] = torch.zeros_like(p)
                     continue
-                score = p1.grad * p1 * p2
-                self.scores[id(p)] = torch.clone(score * p.pow(2)).abs()
+                self.scores[id(p)] = torch.clone(p1.grad.abs() * p.pow(2))
